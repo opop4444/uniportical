@@ -7,6 +7,8 @@ which is exactly what a port forward is.)
 Label your containers with the ports they need; Uniportical reconciles matching
 **static UniFi port-forward rules**.
 
+📦 **Image:** [`opop4444/uniportical`](https://hub.docker.com/r/opop4444/uniportical) on Docker Hub — `docker pull opop4444/uniportical`
+
 ## Why not UPnP / portical?
 
 On UniFi a UPnP request creates the NAT mapping but the zone-based firewall
@@ -16,11 +18,18 @@ never grants the matching WAN-in allow — so the port is mapped yet stays close
 automatically**, so it actually works. Uniportical keeps portical's model and
 swaps the broken backend for one that works.
 
-## Auth: API key only
+## Auth: a local UniFi API key
 
-Authenticates with `X-API-KEY` and nothing else. Create a local key in
-**UniFi Network → Settings → Control Plane → Integrations** (type *UniFi
-Applications / Network*). A Site-Manager (cloud) key won't work.
+Uniportical authenticates with `X-API-KEY` and nothing else — so you need a
+**local** UniFi API key. A Site-Manager (cloud) key will **not** work. To create one:
+
+1. Open your UniFi console in a browser and sign in (e.g. `https://192.168.1.2`).
+2. Go to **Settings → Control Plane → Integrations**.
+3. Click **Create API Key** and give it a name (e.g. `uniportical`); set an expiry.
+4. Under **UniFi Applications**, enable **Network** and select your site.
+   Leave **Site Manager** unchecked.
+5. **Copy the key now — it's shown only once**, then put it in `.env` as
+   `UNIFI_API_KEY`.
 
 ## Configuration — only the un-detectable
 
@@ -63,16 +72,29 @@ docker run -d --name myapp -l uniportical.forward="8050/udp" your/image
 
 ## Run
 
-```sh
-docker build -t uniportical:local .
-echo 'UNIFI_API_KEY=your-unifi-api-key' > .env
+Pulls the published image from Docker Hub — no build step.
 
-docker compose run --rm uniportical check        # verify key + show discovered port/site/wan
-docker compose run --rm uniportical update -v -n  # dry-run preview
+**docker compose** (uses the bundled `docker-compose.yml`, which reads `.env`):
+
+```sh
+cp .env.example .env                               # fill in UNIFI_HOST + UNIFI_API_KEY
+docker compose run --rm uniportical check          # verify key + show discovered port/site/wan
+docker compose run --rm uniportical update -v -n   # dry-run: preview, makes no changes
 docker compose up -d
+docker compose logs -f uniportical                 # watch reconciles
 ```
 
-`docker compose logs -f uniportical` to watch reconciles.
+**docker run** (equivalent, without compose):
+
+```sh
+docker run -d --name uniportical --restart unless-stopped \
+  --network host \
+  -v /var/run/docker.sock:/var/run/docker.sock:ro \
+  -e UNIFI_HOST=192.168.1.2 \
+  -e UNIFI_API_KEY=your-unifi-api-key \
+  -e UNIPORTICAL_POLL_INTERVAL=30 \
+  opop4444/uniportical
+```
 
 ## Commands
 
