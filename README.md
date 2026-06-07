@@ -96,6 +96,36 @@ docker run -d --name uniportical --restart unless-stopped \
   opop4444/uniportical
 ```
 
+## Example: forward an app
+
+Run uniportical alongside your own containers — label them, and the matching WAN
+port forward appears automatically:
+
+```yaml
+services:
+  uniportical:
+    image: opop4444/uniportical:latest
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    env_file:
+      - .env
+    command: ["poll"]
+
+  webapp:
+    image: nginx
+    restart: unless-stopped
+    ports:
+      - "8080:80"
+    labels:
+      - 'uniportical.forward=8080/tcp'    # WAN tcp/8080 -> this host:8080 -> nginx:80
+      # or: uniportical.forward=published   (derive from the published ports above)
+```
+
+Bring it up and uniportical creates `uniportical: webapp 8080/tcp -> <host-ip>:8080`
+in UniFi. Stop or unlabel `webapp` and the rule is pruned on the next reconcile.
+
 ## Commands
 
 | Command | Behaviour |
