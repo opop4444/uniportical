@@ -1,18 +1,10 @@
 services:
   uniportical:
-    build: .
-    image: uniportical:local
-    container_name: uniportical
+    image: opop4444/uniportical:latest
     restart: unless-stopped
-    # host networking lets Uniportical auto-detect the host's LAN IP (for host/bridge
-    # container targets) and reach the controller. Drop it and set UNIPORTICAL_HOST_IP
-    # explicitly if you prefer a bridged container.
     network_mode: host
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
-    environment:
-      UNIFI_HOST: "192.168.1.2"
-      UNIFI_API_KEY: "${UNIFI_API_KEY:?set UNIFI_API_KEY in .env}"
-      UNIPORTICAL_POLL_INTERVAL: "30"          # reconcile every 30s in poll mode
-      # UNIPORTICAL_HOST_IP: "192.168.1.45"   # only needed without host networking
+    env_file:
+      - .env
     command: ["poll"]
