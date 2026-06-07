@@ -97,7 +97,17 @@ discover() {
 # this Docker host's LAN IP (for host/bridge targets)
 host_ip() {
   if [ -n "$UNIPORTICAL_HOST_IP" ]; then echo "$UNIPORTICAL_HOST_IP"; return; fi
-  ip -4 route get "$UNIFI_HOST" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}'
+  local ip
+  ip="$(ip -4 route get "$UNIFI_HOST" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')"
+  # A bridged container's route source is its OWN Docker IP (172.16.0.0/12), not
+  # the host's LAN IP — NAT hides the real host address, so it can't be detected
+  # from inside a bridge. Refuse it (warn) instead of creating a dead forward.
+  case "$ip" in
+    172.1[6-9].*|172.2[0-9].*|172.3[01].*)
+      echo "  ! auto-detected ${ip} (a Docker bridge IP, not the host LAN IP) — set UNIPORTICAL_HOST_IP or run with --network host" >&2
+      return ;;
+  esac
+  echo "$ip"
 }
 
 # ---- reconcile -------------------------------------------------------------
