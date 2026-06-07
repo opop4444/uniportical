@@ -1,0 +1,56 @@
+version: 2.1
+
+# Builds the uniportical Docker image on every push / pull request and smoke-tests
+# that the entrypoint script is present and parses. An optional publish job (push
+# to GitHub Container Registry on main) is included below — see notes to enable it.
+
+jobs:
+  build:
+    docker:
+      - image: cimg/base:current
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run:
+          name: Build the uniportical image
+          command: docker build -t uniportical:ci .
+      - run:
+          name: Smoke test — entrypoint script is present and parses
+          command: docker run --rm --entrypoint bash uniportical:ci -n /usr/local/bin/uniportical
+      - run:
+          name: Save the built image as a downloadable artifact
+          command: docker save uniportical:ci -o uniportical-image.tar
+      - store_artifacts:
+          path: uniportical-image.tar
+          destination: uniportical-image.tar
+
+  # OPTIONAL — build & push to GitHub Container Registry (ghcr.io) on main.
+  # To enable: (1) uncomment the `publish` block in the workflow below, and
+  # (2) in CircleCI → Project Settings → Environment Variables, add:
+  #       GHCR_USERNAME = opop4444
+  #       GHCR_PAT      = a GitHub PAT with the `write:packages` scope
+  publish:
+    docker:
+      - image: cimg/base:current
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run:
+          name: Build and push to ghcr.io
+          command: |
+            echo "$GHCR_PAT" | docker login ghcr.io -u "$GHCR_USERNAME" --password-stdin
+            IMAGE="ghcr.io/${GHCR_USERNAME}/uniportical"
+            docker build -t "$IMAGE:latest" -t "$IMAGE:$CIRCLE_SHA1" .
+            docker push "$IMAGE:latest"
+            docker push "$IMAGE:$CIRCLE_SHA1"
+
+workflows:
+  ci:
+    jobs:
+      - build
+      # Uncomment to publish images on main once GHCR_USERNAME / GHCR_PAT are set:
+      # - publish:
+      #     requires: [build]
+      #     filters:
+      #       branches:
+      #         only: main

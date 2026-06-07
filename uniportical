@@ -1,0 +1,258 @@
+#!/usr/bin/env bash
+#
+# Uniportical — UniFi + portical.
+#
+# Declarative, label-driven port forwarding for Docker that creates *static*
+# UniFi port-forward rules through the controller API. (UPnP-based tools fail on
+# UniFi: the mapping is created but the zone-based firewall never grants the
+# WAN-in allow, so the port stays closed. A static forward gets that allow
+# automatically — so it actually works.)
+#
+# Auth: **API key only** (X-API-KEY). Everything that can be discovered is
+# discovered, so the environment only carries what genuinely cannot be:
+#
+#   UNIFI_HOST               controller IP/host                       (required)
+#   UNIFI_API_KEY            local UniFi API key (or UNIFI_API_KEY_FILE) (required)
+#   UNIPORTICAL_POLL_INTERVAL seconds between reconciles in poll mode   (required for `poll`)
+#   UNIPORTICAL_HOST_IP       LAN IP for host/bridge container targets  (optional;
+#                            auto-detected from the route to the controller when
+#                            this container runs on the host network)
+#
+# Auto-detected from the controller: port, site, WAN interface.
+# Flags: -l <label> | -d <seconds> | -w <wan> | -v | -f | -n (dry-run) | --no-prune
+# Commands: poll (default) | listen | update | check
+set -o pipefail
+
+# ---- environment: only the un-detectable ----------------------------------
+UNIFI_HOST="${UNIFI_HOST:-}"
+UNIFI_API_KEY="${UNIFI_API_KEY:-}"
+UNIPORTICAL_HOST_IP="${UNIPORTICAL_HOST_IP:-}"
+[ -n "${UNIFI_API_KEY_FILE:-}" ] && [ -r "$UNIFI_API_KEY_FILE" ] && UNIFI_API_KEY="$(cat "$UNIFI_API_KEY_FILE")"
+
+# ---- invocation modifiers --------------------------------------------------
+LABEL="uniportical.forward"
+INTERVAL="${UNIPORTICAL_POLL_INTERVAL:-}"   # exposed env; -d overrides; required for poll
+PRUNE=true
+WAN_OVERRIDE=""
+verbose=false; force=false; dry_run=false
+
+while (( "$#" )); do
+  case $1 in
+    -l|--label)    LABEL="$2"; shift 2 ;;
+    -d|--duration) INTERVAL="$2"; shift 2 ;;
+    -w|--wan)      WAN_OVERRIDE="$2"; shift 2 ;;
+    --no-prune)    PRUNE=false; shift ;;
+    -v|--verbose)  verbose=true; shift ;;
+    -f|--force)    force=true; shift ;;
+    -n|--dry-run)  dry_run=true; shift ;;
+    *) break ;;
+  esac
+done
+
+NAME_PREFIX="uniportical:"   # rules we manage are named "uniportical: <host> <ext>/<proto>"
+
+log()  { echo "$@"; }
+vlog() { $verbose && echo "$@" || true; }
+die()  { echo "Error: $*" >&2; exit 1; }
+
+PORT=""; SITE=""; BASE=""; WAN=""
+
+validate() {
+  local m=()
+  [ -n "$UNIFI_HOST" ]    || m+=("UNIFI_HOST")
+  [ -n "$UNIFI_API_KEY" ] || m+=("UNIFI_API_KEY (or UNIFI_API_KEY_FILE)")
+  [ ${#m[@]} -eq 0 ] || die "missing required env: ${m[*]}"
+}
+
+curlk() { curl -sk --max-time 15 -H "X-API-KEY: ${UNIFI_API_KEY}" "$@"; }
+
+# api METHOD PATH [JSON] -> body (classic /rest endpoints, X-API-KEY auth)
+api() {
+  local method="$1" path="$2" data="${3:-}"
+  if [ -n "$data" ]; then
+    curlk -X "$method" -H "Content-Type: application/json" --data "$data" "${BASE}${path}"
+  else
+    curlk -X "$method" "${BASE}${path}"
+  fi
+}
+pf_list() { api GET "/rest/portforward"; }
+
+# Discover port + site (integration API), then WAN interface.
+discover() {
+  local body
+  for p in 443 11443 8443; do
+    body="$(curlk "https://${UNIFI_HOST}:${p}/proxy/network/integration/v1/sites" 2>/dev/null)"
+    if echo "$body" | jq -e '.data' >/dev/null 2>&1; then
+      PORT="$p"; SITE="$(echo "$body" | jq -r '.data[0].internalReference // "default"')"; break
+    fi
+  done
+  [ -n "$PORT" ] || die "cannot reach UniFi API on ${UNIFI_HOST} (tried 443/11443/8443). Check UNIFI_HOST and UNIFI_API_KEY."
+  BASE="https://${UNIFI_HOST}:${PORT}/proxy/network/api/s/${SITE}"
+  if [ -n "$WAN_OVERRIDE" ]; then WAN="$WAN_OVERRIDE"
+  else WAN="$(api GET "/rest/networkconf" | jq -r '[.data[]? | select(.purpose=="wan")][0].wan_networkgroup // empty' | tr 'A-Z' 'a-z')"; [ -n "$WAN" ] || WAN="wan"
+  fi
+  vlog "discovered: port=${PORT} site=${SITE} wan=${WAN}"
+}
+
+# this Docker host's LAN IP (for host/bridge targets)
+host_ip() {
+  if [ -n "$UNIPORTICAL_HOST_IP" ]; then echo "$UNIPORTICAL_HOST_IP"; return; fi
+  ip -4 route get "$UNIFI_HOST" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}'
+}
+
+# ---- reconcile -------------------------------------------------------------
+PF_CACHE=""; DESIRED_FILE=""
+
+ensure_forward() {
+  local ext="$1" int="$2" proto="$3" ip="$4" machine="$5"
+  case "$proto" in tcp|udp|tcp_udp) ;; *) proto="tcp_udp" ;; esac
+  if [ -z "$ip" ]; then
+    log "  skip ${machine} ${ext}/${proto}: no internal IP — set UNIPORTICAL_HOST_IP or run on the host network"
+    return
+  fi
+  # Identity = (container, external port, protocol). The internal target (ip:port)
+  # is the mutable payload, so changing it UPDATES this rule in place.
+  local name="${NAME_PREFIX} ${machine} ${ext}/${proto}"
+
+  local l4s l4 k
+  case "$proto" in tcp_udp) l4s="tcp udp" ;; *) l4s="$proto" ;; esac
+
+  # Never share an external port with a rule we don't manage — any protocol.
+  if [ -n "${FOREIGN[$ext]:-}" ]; then
+    log "  CONFLICT: ${machine} wants external ${ext}, already used by a non-Uniportical rule [${FOREIGN[$ext]}] — skipping [${name}]"
+    return
+  fi
+  # Among our own rules, tcp and udp may share a port (we manage both).
+  for l4 in $l4s; do
+    k="${ext}/${l4}"
+    if [ -n "${CLAIMED[$k]:-}" ] && [ "${CLAIMED[$k]}" != "$name" ]; then
+      log "  CONFLICT: ${machine} wants external ${ext}/${l4}, already claimed by Uniportical rule [${CLAIMED[$k]}] — skipping [${name}]"
+      return
+    fi
+  done
+  for l4 in $l4s; do CLAIMED["${ext}/${l4}"]="$name"; done
+
+  echo "$name" >> "$DESIRED_FILE"
+
+  local desired
+  desired="$(jq -nc \
+      --arg name "$name" --arg dst "$ext" --arg fwd "$ip" --arg fp "$int" \
+      --arg proto "$proto" --arg wan "$WAN" \
+      '{name:$name,enabled:true,pfwd_interface:$wan,src:"any",dst_port:$dst,fwd:$fwd,fwd_port:$fp,proto:$proto,log:false}')"
+
+  local id cur want
+  id="$(echo "$PF_CACHE" | jq -r --arg n "$name" '.data[]? | select(.name==$n) ._id' | head -1)"
+  if [ -n "$id" ] && [ "$id" != "null" ]; then
+    cur="$(echo "$PF_CACHE" | jq -c --arg n "$name" '.data[]? | select(.name==$n) | {name,enabled,pfwd_interface,src,dst_port,fwd,fwd_port,proto}')"
+    want="$(echo "$desired" | jq -c '{name,enabled,pfwd_interface,src,dst_port,fwd,fwd_port,proto}')"
+    if [ "$cur" = "$want" ] && [ "$force" = false ]; then
+      vlog "  unchanged: ${name} -> ${ip}:${int}"; return
+    fi
+    log "  update: ${name} -> ${ip}:${int}"
+    $dry_run && return
+    api PUT "/rest/portforward/${id}" "$(echo "$desired" | jq -c --arg id "$id" '. + {_id:$id}')" >/dev/null || log "    ! update failed"
+  else
+    log "  create: ${name} -> ${ip}:${int}"
+    $dry_run && return
+    api POST "/rest/portforward" "$desired" >/dev/null || log "    ! create failed"
+  fi
+}
+
+prune_rules() {
+  [ "$PRUNE" = "true" ] || return
+  pf_list | jq -r --arg pfx "$NAME_PREFIX" '.data[]? | select(.name|startswith($pfx)) | [._id,.name] | @tsv' |
+  while IFS=$'\t' read -r id name; do
+    if ! grep -qxF "$name" "$DESIRED_FILE"; then
+      log "  prune: ${name}"
+      $dry_run && continue
+      api DELETE "/rest/portforward/${id}" >/dev/null || log "    ! delete failed"
+    fi
+  done
+}
+
+process_container() {
+  local container="$1" label_value network_name network_driver internal_ip
+  label_value="$(docker inspect --format "{{ index .Config.Labels \"${LABEL}\" }}" "$container" 2>/dev/null)"
+  [ -n "$label_value" ] || return
+
+  network_name="$(docker inspect -f '{{range $k,$_ := .NetworkSettings.Networks}}{{$k}} {{end}}' "$container" | awk '{print $1}')"
+  network_driver="$(docker network inspect -f '{{.Driver}}' "$network_name" 2>/dev/null || echo bridge)"
+  case "$network_driver" in
+    macvlan|ipvlan) internal_ip="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' "$container" | awk '{print $1}')" ;;
+    host|bridge|*)  internal_ip="$(host_ip)" ;;
+  esac
+  vlog "container=${container} driver=${network_driver} -> ${internal_ip:-<unset>}"
+
+  if [ "$label_value" = "published" ]; then
+    label_value="$(docker inspect --format='{{ range $key, $value := .NetworkSettings.Ports }}{{ range $value }}{{.HostPort}}:{{ $key }}
+{{ end }}{{ end }}' "$container" | sort | uniq | tr '\n' ',' | sed 's/:[0-9]*//')"
+  fi
+
+  IFS=',' read -ra rules <<< "$label_value"
+  for rule in "${rules[@]}"; do
+    [ -n "$rule" ] || continue
+    if [[ $rule =~ ([0-9]+)(:([0-9]+))?(/(tcp|udp|tcp_udp))? ]]; then
+      ensure_forward "${BASH_REMATCH[1]}" "${BASH_REMATCH[3]:-${BASH_REMATCH[1]}}" "${BASH_REMATCH[5]:-tcp_udp}" "$internal_ip" "$container"
+    fi
+  done
+}
+
+# ---- commands --------------------------------------------------------------
+update() {
+  validate; discover
+  PF_CACHE="$(pf_list)"
+  echo "$PF_CACHE" | jq -e '.data' >/dev/null 2>&1 || die "cannot read port forwards: $(echo "$PF_CACHE" | head -c 200)"
+  DESIRED_FILE="$(mktemp)"; : > "$DESIRED_FILE"
+  unset CLAIMED; declare -gA CLAIMED   # (ext/l4proto) -> owning Uniportical rule (this run)
+  unset FOREIGN; declare -gA FOREIGN   # external port -> existing NON-Uniportical rule (any proto)
+  while IFS=$'\t' read -r _n _d; do
+    case "$_n" in "${NAME_PREFIX}"*) continue ;; esac   # skip our own rules
+    [ -n "$_d" ] && FOREIGN["$_d"]="$_n"
+  done < <(echo "$PF_CACHE" | jq -r '.data[]? | [.name, (.dst_port // "")] | @tsv')
+
+  log "Finding containers with label '${LABEL}'..."
+  # sorted so the winner of any external-port clash is deterministic across cycles
+  while read -r container; do
+    [ -n "$container" ] && process_container "$container"
+  done < <(docker ps --filter "label=${LABEL}" --format '{{.Names}}' | sort)
+
+  prune_rules
+  rm -f "$DESIRED_FILE"
+
+  log "Managed UniFi port forwards:"
+  pf_list | jq -r --arg pfx "$NAME_PREFIX" '.data[]? | select(.name|startswith($pfx)) | "  \(.proto) \(.dst_port) -> \(.fwd):\(.fwd_port)  [\(.name)]"'
+}
+
+check() {
+  validate; discover
+  local out; out="$(pf_list)"
+  echo "$out" | jq -e '.data' >/dev/null 2>&1 || die "connected but API returned: $(echo "$out" | head -c 300)"
+  log "OK: ${UNIFI_HOST}:${PORT} site=${SITE} wan=${WAN} (X-API-KEY); existing forwards: $(echo "$out" | jq '.data | length')"
+  log "host IP for host/bridge targets: $(host_ip || echo '<undetected — set UNIPORTICAL_HOST_IP>')"
+}
+
+listen() {
+  update
+  log "Listening for Docker start/die/destroy events with label '${LABEL}'..."
+  docker events --filter "label=${LABEL}" --filter "type=container" \
+                --filter "event=start" --filter "event=die" --filter "event=destroy" \
+                --format '{{.Actor.Attributes.name}}' |
+  while read -r _; do update; done
+}
+
+poll() {
+  [ -n "$INTERVAL" ] || die "missing required env: UNIPORTICAL_POLL_INTERVAL (or pass -d <seconds>)"
+  while true; do
+    update
+    log "Sleeping for ${INTERVAL} seconds..."
+    sleep "$INTERVAL"
+  done
+}
+
+command="${1:-poll}"; shift || true
+if declare -f "$command" >/dev/null; then
+  "$command" "$@"
+else
+  echo "Error: '$command' is not a valid command (poll|listen|update|check)." >&2
+  exit 1
+fi

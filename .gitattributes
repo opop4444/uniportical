@@ -1,0 +1,3 @@
+# This project runs in Linux containers. Force LF so bash and Docker never
+# choke on CRLF (a CRLF shebang silently breaks the entrypoint on Windows clones).
+* text=auto eol=lf

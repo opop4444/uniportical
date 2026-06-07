@@ -1,0 +1,7 @@
+# Local secrets — never commit. Use .env.example as the template.
+.env
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.swp
